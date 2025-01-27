@@ -7,6 +7,14 @@ import time
 import tensorrt as trt
 from cuda import cudart  # Requires: pip3 install nvidia-cuda-python
 
+import posix_ipc
+import mmap
+import argparse
+
+# 공유 메모리 설정
+SHARED_MEMORY_NAME = "/object_detection"
+MEMORY_SIZE = 1024  # 1KB
+
 
 class YOLOv5TRTNoPyCUDA:
     def __init__(self, engine_path, input_hw=(640, 640)):
@@ -97,98 +105,100 @@ class YOLOv5TRTNoPyCUDA:
         return result
 
 
-def start_camera_stream_client(
-    server_ip="192.168.0.160",
-    port=10000,
-    engine_path="/home/group5/AI_Cannon/milestone2/model/yolov5s_custom.engine",
-):
+def start_camera_stream_client(engine_path="/home/group5/AI_Cannon/milestone2/model/yolov5s_custom.engine"):
+    # Clean up existing shared memory (if any)
+    try:
+        posix_ipc.unlink_shared_memory(SHARED_MEMORY_NAME)
+        posix_ipc.unlink_semaphore(SHARED_MEMORY_NAME)
+    except posix_ipc.ExistentialError:
+        pass
+    
+    # Create shared memory and semaphore
+    shared_memory = posix_ipc.SharedMemory(SHARED_MEMORY_NAME, posix_ipc.O_CREX, size=MEMORY_SIZE)
+    semaphore = posix_ipc.Semaphore(SHARED_MEMORY_NAME, posix_ipc.O_CREX)
+    memory_map = mmap.mmap(shared_memory.fd, MEMORY_SIZE)
+    shared_memory.close_fd()
+
+    # Initialize YOLO
     yolo = YOLOv5TRTNoPyCUDA(engine_path, input_hw=(640, 640))
 
-    client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.connect((server_ip, port))
-    print(f"Connected to server {server_ip}:{port}")
-
-    def recvall(sock, count):
-        buf = b""
-        while count:
-            newbuf = sock.recv(count)
-            if not newbuf:
-                return None
-            buf += newbuf
-            count -= len(newbuf)
-        return buf
+    # Initialize USB camera
+    cap = cv2.VideoCapture(0)  # 0 or the index of your USB camera
+    if not cap.isOpened():
+        print("Cannot open camera.")
+        return
 
     prev_time = time.time()
+
     while True:
-        bfr = recvall(client_socket, 4)
-        if not bfr:
-            print("Socket closed by server.")
-            break
-        image_size = int.from_bytes(bfr, "big")
-
-        bfr = recvall(client_socket, 4)
-        if not bfr:
-            print("Socket closed by server.")
-            break
-        message_type = int.from_bytes(bfr, "big")
-
-        stringData = recvall(client_socket, image_size)
-        if not stringData:
-            print("No image data.")
+        ret, frame = cap.read()
+        if not ret:
+            print("No frame data from camera.")
             break
 
-        if message_type == 3:
-            data = np.frombuffer(stringData, dtype=np.uint8)
-            frame = cv2.imdecode(data, 1)
-            frame = cv2.flip(frame, -1)
-            if frame is None:
-                continue
+        # Optional: flip frame if needed
+        frame = cv2.flip(frame, -1)
 
-            original_hw = frame.shape[:2]
-            raw_output = yolo.infer(frame)
-            detections = yolo.postprocess(raw_output, original_hw)
+        original_hw = frame.shape[:2]
+        # print(original_hw)
+        raw_output = yolo.infer(frame)
+        detections = yolo.postprocess(raw_output, original_hw)
+        # print("detection is:", detections)
 
-            for x1, y1, x2, y2, conf in detections:
-                cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                cv2.putText(
-                    frame,
-                    f"{conf:.2f}",
-                    (x1, y1 - 5),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.5,
-                    (0, 255, 0),
-                    2,
-                )
+        # Pack detection results into shared memory
+        binary_data = struct.pack('i' + 'f' * 5 * len(detections),
+                                  len(detections),
+                                  *[value for bbox in detections for value in bbox])
+        
+        semaphore.acquire()
+        memory_map.seek(0)
+        memory_map.write(binary_data)
+        semaphore.release()
 
-            # FPS
-            curr_time = time.time()
-            fps = 1 / (curr_time - prev_time)
-            prev_time = curr_time
+        # Calculate and display FPS
+        curr_time = time.time()
+        fps = 1.0 / (curr_time - prev_time)
+        prev_time = curr_time
 
+        cv2.putText(
+            frame,
+            f"FPS: {fps:.2f}",
+            (10, 30),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1,
+            (0, 0, 255),
+            2
+        )
+
+        # Draw bounding boxes
+        for det in detections:
+            x1, y1, x2, y2, conf = det
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
             cv2.putText(
                 frame,
-                f"FPS: {fps:.2f}",
-                (10, 30),
+                f"Conf: {conf:.2f}",
+                (x1, y1 - 10),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                1,
-                (0, 0, 255),
-                2,
+                0.5,
+                (0, 255, 0),
+                2
             )
 
-            cv2.imshow("YOLOv5 TRT (no pycuda)", frame)
-        else:
-            print("Unknown message type:", message_type)
+        # Show the processed frame
+        cv2.imshow("Detection", frame)
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
 
-    client_socket.close()
+    # Cleanup
+    memory_map.close()
+    shared_memory.unlink()
+    semaphore.unlink()
+    cap.release()
     cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
     start_camera_stream_client(
-        server_ip="192.168.0.160",  # raspberry pi ip
-        port=10000,  # ./SendImageTCP 10000
         engine_path="/home/group5/AI_Cannon/milestone2/model/yolov5s_custom.engine",
     )
